@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -15,7 +16,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("Codex 额度卡")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.0.1.0")]
 
 internal static class Taskbar
 {
@@ -186,12 +187,46 @@ internal sealed class Card : Form
     private static extern bool DestroyIcon(IntPtr icon);
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")]
+    private static extern bool UpdateLayeredWindow(IntPtr window, IntPtr screen, ref Point destination, ref Size size,
+        IntPtr source, ref Point origin, uint key, ref BlendFunction blend, uint flags);
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateDIBSection(IntPtr dc, ref BitmapHeader header, uint usage, out IntPtr bits,
+        IntPtr section, uint offset);
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr SelectObject(IntPtr dc, IntPtr handle);
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr handle);
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteDC(IntPtr dc);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BitmapHeader
+    {
+        public uint Size;
+        public int Width, Height;
+        public ushort Planes, BitCount;
+        public uint Compression, ImageSize;
+        public int XPelsPerMeter, YPelsPerMeter;
+        public uint ColorsUsed, ImportantColors;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct BlendFunction
+    {
+        public byte Operation, Flags, Opacity, AlphaFormat;
+    }
 
     private readonly System.Windows.Forms.Timer placementTimer = new System.Windows.Forms.Timer { Interval = 1000 };
     private readonly ToolTip tip = new ToolTip { ShowAlways = true, AutoPopDelay = 10000 };
     private readonly ContextMenuStrip trayMenu = new ContextMenuStrip();
     private readonly NotifyIcon trayButton;
-    private readonly Icon trayImage;
+    private Icon trayImage;
+    private bool lightTheme;
+    private Size frameSize;
+    private bool frameFloating;
     private readonly JavaScriptSerializer json = new JavaScriptSerializer();
     private readonly string root = AppDomain.CurrentDomain.BaseDirectory;
     private readonly int session = Process.GetCurrentProcess().SessionId;
@@ -211,14 +246,13 @@ internal sealed class Card : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         TopMost = true;
-        DoubleBuffered = true;
-        ResizeRedraw = true;
         Text = "Codex 用量卡片";
         AccessibleName = Text;
         tip.SetToolTip(this, quota.title);
         // Create the handle before asynchronous quota updates start arriving.
         CreateHandle();
-        trayImage = CreateTrayImage();
+        lightTheme = UsesLightTheme();
+        trayImage = CreateTrayImage(lightTheme);
         trayMenu.Items.Add("显示额度卡", null, delegate { ShowFromTray(); });
         trayButton = new NotifyIcon {
             Icon = trayImage, Text = "Codex 额度卡 · 点击显示", ContextMenuStrip = trayMenu, Visible = true
@@ -232,18 +266,24 @@ internal sealed class Card : Form
 
     protected override bool ShowWithoutActivation { get { return true; } }
 
-    private static Icon CreateTrayImage()
+    private static bool UsesLightTheme()
     {
-        using (var bitmap = new Bitmap(32, 32))
+        return Equals(Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "SystemUsesLightTheme", 0), 1);
+    }
+
+    private static Icon CreateTrayImage(bool light)
+    {
+        Color teal = light ? Color.FromArgb(0, 112, 90) : Color.FromArgb(114, 231, 191);
+        using (var bitmap = new Bitmap(32, 32, PixelFormat.Format32bppArgb))
         using (var g = Graphics.FromImage(bitmap))
-        using (var background = new SolidBrush(Color.FromArgb(31, 43, 40)))
-        using (var track = new Pen(Color.FromArgb(80, 106, 97), 4))
-        using (var meter = new Pen(Color.FromArgb(114, 231, 191), 4) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+        using (var track = new Pen(Color.FromArgb(100, teal), 4))
+        using (var meter = new Pen(teal, 4) { StartCap = LineCap.Round, EndCap = LineCap.Round })
         {
+            g.Clear(Color.Transparent);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.FillEllipse(background, 1, 1, 30, 30);
-            g.DrawEllipse(track, 6, 6, 20, 20);
-            g.DrawArc(meter, 6, 6, 20, 20, -90, 270);
+            g.DrawArc(track, 5, 5, 22, 22, 180, 90);
+            g.DrawArc(meter, 5, 5, 22, 22, -90, 270);
             IntPtr icon = bitmap.GetHicon();
             try { return (Icon)Icon.FromHandle(icon).Clone(); }
             finally { DestroyIcon(icon); }
@@ -252,7 +292,9 @@ internal sealed class Card : Form
 
     private void ShowFromTray()
     {
-        if (chatGptOpen == true || ChatGptDesktop.FindImage(session) != null) ShowAt(Visible ? Bounds : FallbackBounds());
+        if (chatGptOpen != true && ChatGptDesktop.FindImage(session) == null) return;
+        if (Visible) ShowAt(Bounds, frameFloating);
+        else ShowAt(FallbackBounds(), floating: true);
     }
 
     private Rectangle FallbackBounds()
@@ -260,13 +302,13 @@ internal sealed class Card : Form
         return Taskbar.FallbackBounds(lastSlot.IsEmpty ? (int?)null : lastSlot.Left + lastSlot.Width / 2);
     }
 
-    private void ShowAt(Rectangle bounds)
+    private void ShowAt(Rectangle bounds, bool floating)
     {
-        if (Bounds != bounds)
+        if (frameSize != bounds.Size || frameFloating != floating)
         {
-            Bounds = bounds;
-            Invalidate();
+            if (!RenderFrame(bounds, floating)) return;
         }
+        else if (Location != bounds.Location) Location = bounds.Location;
         if (!Visible) Show();
         const uint noMoveNoResizeNoActivate = 0x0013;
         SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, noMoveNoResizeNoActivate);
@@ -277,7 +319,7 @@ internal sealed class Card : Form
         get
         {
             var options = base.CreateParams;
-            options.ExStyle |= 0x00000080 | 0x08000000; // Tool window, no activation.
+            options.ExStyle |= 0x00000080 | 0x08000000 | 0x00080000; // Tool window, no activation, per-pixel alpha.
             return options;
         }
     }
@@ -298,19 +340,6 @@ internal sealed class Card : Form
         path.AddArc(inset, bottom, 14, 14, 90, 90);
         path.CloseFigure();
         return path;
-    }
-
-    protected override void OnResize(EventArgs e)
-    {
-        base.OnResize(e);
-        if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
-        using (var outline = Outline(0))
-        using (var scale = new Matrix())
-        {
-            scale.Scale(ClientSize.Width / (float)Taskbar.CardWidth, ClientSize.Height / (float)Taskbar.CardHeight);
-            outline.Transform(scale);
-            Region = new Region(outline);
-        }
     }
 
     private void StartReader(string clientImage)
@@ -365,11 +394,23 @@ internal sealed class Card : Form
         quota = value;
         AccessibleDescription = value.title;
         tip.SetToolTip(this, value.title);
-        Invalidate();
+        frameSize = Size.Empty;
+        if (Visible) RenderFrame(Bounds, frameFloating);
     }
 
     private async Task Tick()
     {
+        bool light = UsesLightTheme();
+        if (light != lightTheme)
+        {
+            lightTheme = light;
+            var nextIcon = CreateTrayImage(light);
+            trayButton.Icon = nextIcon;
+            trayImage.Dispose();
+            trayImage = nextIcon;
+            frameSize = Size.Empty;
+            if (Visible) RenderFrame(Bounds, frameFloating);
+        }
         string clientImage = ChatGptDesktop.FindImage(session);
         bool open = clientImage != null;
         if (chatGptOpen != open)
@@ -390,7 +431,7 @@ internal sealed class Card : Form
             return;
         }
 
-        if (!Visible) ShowAt(FallbackBounds());
+        if (!Visible) ShowAt(FallbackBounds(), floating: true);
         if ((reader == null || reader.HasExited) && DateTime.UtcNow >= nextReaderStart) StartReader(clientImage);
         if (lastReading != default(DateTime) && (DateTime.UtcNow - lastReading).TotalSeconds > 100)
         {
@@ -412,28 +453,74 @@ internal sealed class Card : Form
             {
                 lastSlot = slot;
                 missedSlots = 0;
-                ShowAt(slot);
+                ShowAt(slot, floating: false);
             }
             else if (++missedSlots >= 2)
             {
-                ShowAt(FallbackBounds());
+                ShowAt(FallbackBounds(), floating: true);
             }
         }
         finally { placing = false; }
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    private bool RenderFrame(Rectangle bounds, bool floating)
     {
-        base.OnPaint(e);
-        var g = e.Graphics;
-        g.ScaleTransform(ClientSize.Width / (float)Taskbar.CardWidth, ClientSize.Height / (float)Taskbar.CardHeight);
+        var size = bounds.Size;
+        if (size.Width <= 0 || size.Height <= 0) return false;
+        var dc = CreateCompatibleDC(IntPtr.Zero);
+        if (dc == IntPtr.Zero) return false;
+        var dib = IntPtr.Zero;
+        var previous = IntPtr.Zero;
+        try
+        {
+            // DWM expects a top-down bitmap with premultiplied alpha.
+            var header = new BitmapHeader {
+                Size = (uint)Marshal.SizeOf(typeof(BitmapHeader)), Width = size.Width, Height = -size.Height,
+                Planes = 1, BitCount = 32
+            };
+            IntPtr bits;
+            dib = CreateDIBSection(dc, ref header, 0, out bits, IntPtr.Zero, 0);
+            if (dib == IntPtr.Zero || bits == IntPtr.Zero) return false;
+            previous = SelectObject(dc, dib);
+            if (previous == IntPtr.Zero) return false;
+            using (var bitmap = new Bitmap(size.Width, size.Height, size.Width * 4, PixelFormat.Format32bppPArgb, bits))
+            using (var g = Graphics.FromImage(bitmap))
+            {
+                g.Clear(Color.Transparent);
+                g.ScaleTransform(size.Width / (float)Taskbar.CardWidth, size.Height / (float)Taskbar.CardHeight);
+                DrawCard(g, quota, lightTheme, floating);
+            }
+            var destination = bounds.Location;
+            var origin = Point.Empty;
+            var blend = new BlendFunction { Opacity = 255, AlphaFormat = 1 };
+            if (!UpdateLayeredWindow(Handle, IntPtr.Zero, ref destination, ref size, dc, ref origin, 0, ref blend, 2))
+                return false;
+            // The native layered-window move can leave WinForms' cached bounds stale.
+            if (Bounds != bounds) UpdateBounds();
+            frameSize = size;
+            frameFloating = floating;
+            return true;
+        }
+        finally
+        {
+            if (previous != IntPtr.Zero) SelectObject(dc, previous);
+            if (dib != IntPtr.Zero) DeleteObject(dib);
+            DeleteDC(dc);
+        }
+    }
+
+    private static void DrawCard(Graphics g, Quota quota, bool light, bool floating)
+    {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-        bool light = Equals(Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "SystemUsesLightTheme", 0), 1);
-        g.Clear(light ? Color.FromArgb(236, 242, 240) : Color.FromArgb(31, 43, 40));
         using (var body = Outline(1))
-        using (var border = new Pen(light ? Color.FromArgb(193, 209, 203) : Color.FromArgb(63, 83, 77)))
+        using (var border = new Pen(light ? Color.FromArgb(85, 20, 30, 28) : Color.FromArgb(105, 240, 248, 246)))
         {
+            if (floating)
+            {
+                using (var background = new SolidBrush(light ? Color.FromArgb(236, 242, 240) : Color.FromArgb(31, 43, 40)))
+                    g.FillPath(background, body);
+            }
             g.DrawPath(border, body);
         }
 
@@ -452,7 +539,7 @@ internal sealed class Card : Form
         if (tone == "danger") accent = light ? Color.FromArgb(169, 48, 52) : Color.FromArgb(255, 141, 142);
         Color foreground = light ? Color.FromArgb(31, 51, 45) : Color.FromArgb(235, 246, 241);
         var dial = new RectangleF(x, 5, 26, 26);
-        using (var track = new Pen(light ? Color.FromArgb(196, 212, 206) : Color.FromArgb(73, 93, 85), 2.4f))
+        using (var track = new Pen(Color.FromArgb(67, foreground), 2.4f))
         using (var line = new Pen(accent, 2.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
         using (var ink = new SolidBrush(foreground))
         using (var number = new Font("Segoe UI", 8.5f, FontStyle.Bold, GraphicsUnit.Pixel))

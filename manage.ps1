@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$version = '1.0.0'
+$version = '1.0.1'
 $exeName = 'CodexUsageTaskbar.exe'
 
 if ($Action -eq 'build') {
@@ -108,7 +108,7 @@ if (Test-Path -LiteralPath $root) {
     if ((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Unexpected install path.' }
     if (!(Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Install ownership mismatch.' }
     $installedVersion = (Get-Content -LiteralPath $marker -Raw).Trim()
-    if ($installedVersion -ne $version -and !($Action -eq 'install' -and $installedVersion -in @('0.9.5-taskbar.1','0.9.5-taskbar.2','0.9.5-taskbar.3'))) { throw 'Install ownership mismatch.' }
+    if ($installedVersion -ne $version -and !($Action -eq 'install' -and $installedVersion -in @('0.9.5-taskbar.1','0.9.5-taskbar.2','0.9.5-taskbar.3','1.0.0'))) { throw 'Install ownership mismatch.' }
 } elseif ($Action -eq 'uninstall') { return }
 
 switch ($Action) {
